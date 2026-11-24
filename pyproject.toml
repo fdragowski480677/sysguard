@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sysguard"
+version = "0.1.0"
+description = "A small, read-only local threat scanner (keyloggers and other local threats) with a CLI and a Tkinter GUI."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Franciszek Drągowski" }]
+keywords = ["security", "defensive", "keylogger-detection", "linux", "scanner"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+# No third-party runtime dependencies — standard library only.
+# Tkinter ships with CPython (on Debian/Ubuntu: `sudo apt install python3-tk`).
+dependencies = []
+
+[project.scripts]
+sysguard = "sysguard.cli:main"
+sysguard-gui = "sysguard.gui:main"
+
+[project.urls]
+Homepage = "https://github.com/fdragowski480677/sysguard"
+Issues = "https://github.com/fdragowski480677/sysguard/issues"
+
+[tool.setuptools]
+packages = ["sysguard"]
