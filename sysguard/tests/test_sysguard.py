@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from sysguard import detectors, engine, netinfo
+from sysguard import detectors, engine, netinfo, procinfo
 from sysguard.findings import Finding, Severity
 
 
@@ -119,6 +119,54 @@ class WslHelperTests(unittest.TestCase):
             self.assertFalse(procinfo.on_windows_mount("/usr/bin"))
         with mock.patch.object(procinfo, "is_wsl", return_value=False):
             self.assertFalse(procinfo.on_windows_mount("/mnt/c/Users/x"))
+
+
+class LdPreloadTests(unittest.TestCase):
+    def test_lib_is_suspect(self):
+        self.assertTrue(detectors._lib_is_suspect("/tmp/evil.so")[0])        # temp dir
+        self.assertTrue(detectors._lib_is_suspect("relative.so")[0])         # relative
+        self.assertTrue(detectors._lib_is_suspect("/no/such/lib_xyz.so")[0]) # missing
+        # An existing, absolute path outside the suspect dirs is NOT flagged.
+        # (/tmp and /home are themselves suspect, so we use a system path.)
+        safe = "/bin/sh"
+        if os.path.exists(safe):
+            self.assertFalse(detectors._lib_is_suspect(safe)[0])
+
+    def test_split_preload_spaces_and_colons(self):
+        self.assertEqual(
+            detectors._split_preload("a.so:b.so c.so"), ["a.so", "b.so", "c.so"]
+        )
+
+    def test_process_env_preload_is_aggregated_and_high(self):
+        fake_procs = [procinfo.Process(pid=10), procinfo.Process(pid=11)]
+        with mock.patch.object(procinfo, "all_processes", return_value=fake_procs), \
+             mock.patch.object(procinfo, "read_environ",
+                               return_value={"LD_PRELOAD": "/tmp/evil.so"}), \
+             mock.patch("os.path.isfile", return_value=False), \
+             mock.patch("glob.glob", return_value=[]), \
+             mock.patch("os.path.expanduser", return_value="/no/such/home"):
+            findings = detectors.detect_ld_preload()
+        preload = [f for f in findings if f.evidence.get("variable") == "LD_PRELOAD"]
+        self.assertEqual(len(preload), 1, "two PIDs with same value -> one finding")
+        self.assertEqual(preload[0].severity, Severity.HIGH)  # library is in /tmp
+        self.assertEqual(sorted(preload[0].evidence["pids"]), [10, 11])
+
+    def test_persisted_in_rc_file_but_comment_ignored(self):
+        with tempfile.TemporaryDirectory() as home:
+            with open(os.path.join(home, ".bashrc"), "w") as fh:
+                fh.write("# LD_PRELOAD=should_be_ignored\n")
+                fh.write("export LD_PRELOAD=/tmp/evil.so\n")
+            with open(os.path.join(home, ".profile"), "w") as fh:
+                fh.write("# just a comment mentioning LD_PRELOAD=foo\n")
+            only_rc = lambda p: p.endswith((".bashrc", ".profile"))  # noqa: E731
+            with mock.patch.object(procinfo, "all_processes", return_value=[]), \
+                 mock.patch("os.path.isfile", side_effect=only_rc), \
+                 mock.patch("glob.glob", return_value=[]), \
+                 mock.patch("os.path.expanduser", return_value=home):
+                findings = detectors.detect_ld_preload()
+            persisted_paths = {f.evidence["path"] for f in findings if "persisted" in f.title}
+            self.assertIn(os.path.join(home, ".bashrc"), persisted_paths)
+            self.assertNotIn(os.path.join(home, ".profile"), persisted_paths)
 
 
 class EngineTests(unittest.TestCase):

@@ -12,6 +12,7 @@ Design notes
 
 from __future__ import annotations
 
+import glob
 import os
 import re
 import stat
@@ -452,6 +453,191 @@ def detect_writable_path() -> list[Finding]:
 
 
 # ---------------------------------------------------------------------------
+# 7. LD_PRELOAD / LD_AUDIT library injection (dynamic-linker hijacking)
+# ---------------------------------------------------------------------------
+
+# Dynamic-linker variables an attacker uses to force their own code into
+# other programs. This is the basis of many userland rootkits and of
+# library-based keyloggers that hook libc functions (read/getpass/XNextEvent)
+# to capture input across every process they are injected into.
+_LD_INJECT_VARS = ("LD_PRELOAD", "LD_AUDIT")
+
+# Directories a legitimately installed shared library should essentially
+# never live in. A preload pointing here is a strong malware signal.
+_SUSPECT_LIB_DIRS = ("/tmp/", "/dev/shm/", "/var/tmp/", "/run/user/", "/home/")
+
+_LD_PERSIST_RE = re.compile(
+    r"(?:^|[\s;])(?:export\s+)?(LD_PRELOAD|LD_AUDIT)\s*=",
+    re.IGNORECASE,
+)
+
+
+def _lib_is_suspect(lib: str) -> tuple[bool, str]:
+    """Return (suspect?, reason) for a single preloaded library path."""
+    lib = lib.strip()
+    if not lib:
+        return False, ""
+    if any(lib.startswith(d) for d in _SUSPECT_LIB_DIRS):
+        return True, "it lives in a temporary / user-writable directory"
+    if not lib.startswith("/"):
+        # Resolved against each victim process's CWD — a known hijack trick.
+        return True, "it is a relative path (resolved per-process, easily hijacked)"
+    if not os.path.exists(lib):
+        return True, "the library file does not exist on disk"
+    return False, ""
+
+
+def _split_preload(value: str) -> list[str]:
+    """LD_PRELOAD entries are separated by spaces and/or colons."""
+    return [p for chunk in value.split(":") for p in chunk.split() if p]
+
+
+def detect_ld_preload() -> list[Finding]:
+    findings: list[Finding] = []
+
+    # 7a. /etc/ld.so.preload — a global preload applied to EVERY program.
+    preload_file = "/etc/ld.so.preload"
+    try:
+        if os.path.isfile(preload_file):
+            with open(preload_file, "r", errors="replace") as fh:
+                content = fh.read()
+            libs = _split_preload(content)
+            if not libs:
+                findings.append(
+                    Finding(
+                        category="ld-preload",
+                        title="/etc/ld.so.preload exists but is empty",
+                        severity=Severity.LOW,
+                        detail=(
+                            "/etc/ld.so.preload is present but empty. Most systems do "
+                            "not have this file at all; confirm you expect it to exist."
+                        ),
+                        evidence={"path": preload_file},
+                        remediation="If you did not create it, remove it.",
+                    )
+                )
+            for lib in libs:
+                suspect, reason = _lib_is_suspect(lib)
+                sev = Severity.HIGH if suspect else Severity.MEDIUM
+                detail = (
+                    f"'{lib}' is force-loaded into every dynamically linked program on "
+                    "the system via /etc/ld.so.preload. Userland rootkits and "
+                    "library-based keyloggers use exactly this to hook libc functions "
+                    "across all processes at once."
+                )
+                if suspect:
+                    detail += f" It is especially suspicious because {reason}."
+                findings.append(
+                    Finding(
+                        category="ld-preload",
+                        title=f"Global library injection via ld.so.preload: {lib}",
+                        severity=sev,
+                        detail=detail,
+                        evidence={"path": preload_file, "library": lib, "suspect": suspect},
+                        remediation=(
+                            "Verify the library and the package that owns it "
+                            "(dpkg -S / rpm -qf). If unrecognised, treat it as a likely "
+                            "rootkit: preserve a copy for analysis, then remove the "
+                            "entry from /etc/ld.so.preload."
+                        ),
+                    )
+                )
+    except OSError:
+        pass
+
+    # 7b. LD_PRELOAD / LD_AUDIT set in live process environments.
+    # Aggregate by (var, value): one preload inherited by many children should
+    # be a single finding, not dozens.
+    seen: dict[tuple[str, str], list[int]] = {}
+    for proc in procinfo.all_processes(with_fds=False):
+        env = procinfo.read_environ(proc.pid)
+        for var in _LD_INJECT_VARS:
+            value = env.get(var, "").strip()
+            if value:
+                seen.setdefault((var, value), []).append(proc.pid)
+
+    for (var, value), pids in seen.items():
+        reasons = []
+        suspect_any = False
+        for lib in _split_preload(value):
+            is_suspect, reason = _lib_is_suspect(lib)
+            if is_suspect:
+                suspect_any = True
+                reasons.append(f"{lib}: {reason}")
+        sev = Severity.HIGH if suspect_any else Severity.MEDIUM
+        sample = ", ".join(str(p) for p in pids[:5])
+        more = "" if len(pids) <= 5 else f" (+{len(pids) - 5} more)"
+        detail = (
+            f"{var}={value} is set in the environment of {len(pids)} running "
+            f"process(es) [PIDs: {sample}{more}]. {var} forces extra shared libraries "
+            "into those programs and can transparently hook their library calls — used "
+            "by both legitimate debugging/sanitiser tools and by malware/keyloggers."
+        )
+        if suspect_any:
+            detail += " Suspicious entries — " + "; ".join(reasons) + "."
+        findings.append(
+            Finding(
+                category="ld-preload",
+                title=f"{var} set in running process(es)",
+                severity=sev,
+                detail=detail,
+                evidence={"variable": var, "value": value, "pids": pids[:50]},
+                remediation=(
+                    "Work out why these processes have it set (some sanitisers and "
+                    "wrappers use it legitimately). If you did not set it and the "
+                    "library is unfamiliar, analyse the library before touching anything."
+                ),
+            )
+        )
+
+    # 7c. LD_PRELOAD / LD_AUDIT persisted in environment / profile files.
+    persist_files = ["/etc/environment", "/etc/profile"]
+    persist_files += sorted(glob.glob("/etc/profile.d/*.sh"))
+    home = os.path.expanduser("~")
+    persist_files += [
+        os.path.join(home, rc)
+        for rc in (".bashrc", ".bash_profile", ".profile", ".zshrc")
+    ]
+    for path in persist_files:
+        try:
+            if not os.path.isfile(path):
+                continue
+            with open(path, "r", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        found_vars = set()
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue  # ignore comments to avoid false positives
+            match = _LD_PERSIST_RE.search(stripped)
+            if match:
+                found_vars.add(match.group(1).upper())
+        for var in sorted(found_vars):
+            findings.append(
+                Finding(
+                    category="ld-preload",
+                    title=f"{var} persisted in {path}",
+                    severity=Severity.HIGH,
+                    detail=(
+                        f"{path} sets {var}. This makes a library preload persistent "
+                        "across logins/reboots for affected shells (or the whole "
+                        "system), a stealthy way to keep injected code — such as a "
+                        "keylogging hook — loaded."
+                    ),
+                    evidence={"path": path, "variable": var},
+                    remediation=(
+                        f"Open {path} and confirm you added this for a known tool. "
+                        "Remove the line if you did not."
+                    ),
+                )
+            )
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -462,4 +648,5 @@ ALL_DETECTORS = {
     "persistence": detect_persistence,
     "privilege-suid": detect_suid,
     "privilege-path": detect_writable_path,
+    "ld-preload": detect_ld_preload,
 }

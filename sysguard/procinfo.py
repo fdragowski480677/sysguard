@@ -92,6 +92,25 @@ def read_process(pid: int, *, with_fds: bool = True) -> Process | None:
     return proc
 
 
+def read_environ(pid: int) -> dict[str, str]:
+    """Return a process's environment as a dict.
+
+    ``/proc/<pid>/environ`` is NUL-separated ``KEY=VALUE`` entries. Reading
+    another user's environ requires root; without it we simply get an empty
+    dict for those processes, which callers handle gracefully.
+    """
+    raw = _read(f"/proc/{pid}/environ")
+    env: dict[str, str] = {}
+    if not raw:
+        return env
+    for item in raw.split("\x00"):
+        if not item or "=" not in item:
+            continue
+        key, _, value = item.partition("=")
+        env[key] = value
+    return env
+
+
 def all_processes(*, with_fds: bool = True) -> list[Process]:
     out = []
     for pid in iter_pids():

@@ -82,6 +82,7 @@ lab you control** — don't deploy keystroke capture on anyone else's machine.
 | `persistence` | User crontab, XDG autostart, systemd **user** services, and suspicious lines in shell startup files | How malware **survives a reboot**. Shell files are scanned for download-and-run and reverse-shell patterns. |
 | `privilege-suid` | Unusual **SUID-root** binaries outside a known-common allowlist | A planted SUID binary is a textbook **privilege-escalation** backdoor. |
 | `privilege-path` | **World-writable** directories on your `PATH` | Anyone could drop a trojan binary you'd then run by name. (WSL Windows mounts are detected and down-ranked — see below.) |
+| `ld-preload` | `/etc/ld.so.preload`, and `LD_PRELOAD`/`LD_AUDIT` in process environments or persisted in profile files | Dynamic-linker hijacking: force-loads attacker code into other programs. Used by userland rootkits and by **library-based keyloggers** that hook libc input functions. Libraries in temp dirs, relative paths, or missing files are escalated to HIGH. |
 
 Each finding carries a **severity** (`INFO` / `LOW` / `MEDIUM` / `HIGH`), a
 plain-language explanation, supporting **evidence**, and a **remediation** hint.
@@ -214,7 +215,8 @@ sysguard/
 
 - hash flagged binaries and check them against a local allowlist / VirusTotal
   (offline hash only — don't upload files),
-- detect LD_PRELOAD / `/etc/ld.so.preload` hijacks,
+- ~~detect LD_PRELOAD / `/etc/ld.so.preload` hijacks~~ ✅ **done** (the
+  `ld-preload` detector),
 - watch for changes between scans (a lightweight baseline/diff mode),
 - add a packaged `.desktop` launcher,
 - a kernel-module listing check for simple rootkits.
